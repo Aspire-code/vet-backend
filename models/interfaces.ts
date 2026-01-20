@@ -60,6 +60,19 @@ export interface ISearchParams {
     specialization?: string;
 }
 
+// ----------------------------------------------------------------------
+// APPOINTMENT INTERFACES (Used for appointment management)
+// ----------------------------------------------------------------------
+
+export interface IAppointment {
+    appointment_id: string;
+    vet_id: string;
+    client_id: string;
+    service_id: string;
+    scheduled_time: Date;
+    status: string;
+}
+
 // Interface for search results (extends profile data with calculated fields)
 export interface ISearchResult extends IVetProfile {
     distance_km: number;

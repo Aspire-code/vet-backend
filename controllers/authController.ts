@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { v4 as uuidv4 } from "uuid";
+import jwt from "jsonwebtoken";
 
 import {
   getUserByEmail,
@@ -12,6 +13,7 @@ import { UserRole } from "../models/interfaces";
 
 /**
  * POST /api/auth/register
+ * Returns token so user can be logged in immediately after registration
  */
 export const registerUser = async (req: Request, res: Response) => {
   try {
@@ -42,16 +44,29 @@ export const registerUser = async (req: Request, res: Response) => {
       await createInitialVetProfile(userId);
     }
 
-    return res.status(201).json({ message: "User registered successfully" });
+    // ✅ Generate JWT token
+    const payload = { user_id: userId, role };
+    const token = jwt.sign(payload, process.env.JWT_SECRET || "defaultsecret", {
+      expiresIn: "24h",
+    });
+
+    return res.status(201).json({
+      message: "User registered successfully",
+      token,
+      user: {
+        id: userId,
+        name,
+        email,
+        role,
+      },
+    });
   } catch (error: any) {
     console.error(error);
     return res.status(500).json({ message: error.message });
   }
 };
 
-/**
- * POST /api/auth/login
- */
+
 export const loginUser = async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
@@ -70,8 +85,15 @@ export const loginUser = async (req: Request, res: Response) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
+    // ✅ Generate JWT token
+    const payload = { user_id: user.user_id, role: user.role };
+    const token = jwt.sign(payload, process.env.JWT_SECRET || "defaultsecret", {
+      expiresIn: "24h",
+    });
+
     return res.json({
       message: "Login successful",
+      token, // ✅ send token to frontend
       user: {
         id: user.user_id,
         name: user.name,

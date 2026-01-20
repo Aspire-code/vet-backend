@@ -1,133 +1,157 @@
-const { sql, poolPromise } = require('../config/db');
-const crypto = require('crypto');
-
-interface Appointment {
-    appointment_id: string;
-    status: string;
-    date: string;
-    time: string;
-    service: string;
-    vet_name: string;
-    service_name: string;
-}
-
-interface AppointmentInput {
-    vet_id: string;
-    user_id: string;
-    service_id: string;
-    scheduled_time: string;
-    status?: 'pending' | 'completed' | 'cancelled';
-}
-
-interface AllAppointmentRecord {
-    appointment_id: string;
-    vet_id: string;
-    user_id: string;
-    service_id: string;
-    date: string;
-    time: string;
-    status: string;
-    vet_name: string;
-    client_name: string;
-}
+import { sql, poolPromise } from '../config/db';
+import { IAppointment } from './interfaces';
 
 /**
- * Fetches appointments for a specific user.
- * SYNCED: Uses 'user_id' and 'date/time' columns from your DB.
+ * Fetches appointments for the Vet Dashboard.
  */
-const getAppointmentsByUserId = async (user_id: string): Promise<Appointment[]> => {
+export const getAppointmentsByVetId = async (vet_id: string): Promise<any[]> => {
     try {
         const pool = await poolPromise;
-        
         const result = await pool.request()
-            .input('user_id', sql.VarChar(100), user_id)
+            .input('vet_id', sql.VarChar(100), vet_id)
             .query(`
                 SELECT 
-                    a.appointment_id,
-                    a.status,
-                    a.date,          -- From your actual table
-                    a.time,          -- From your actual table
-                    a.service,       -- From your actual table
-                    v.name AS vet_name,
+                    a.appointment_id, 
+                    a.status, 
+                    a.scheduled_time AS appointment_date, 
+                    c.name AS client_name,
                     s.name AS service_name
-                FROM appointments a
-                LEFT JOIN Users v ON a.vet_id = v.user_id
+                FROM Appointments a
+                LEFT JOIN Users c ON a.client_id = c.user_id
                 LEFT JOIN Services s ON a.service_id = s.service_id
-                WHERE a.user_id = @user_id  -- Corrected from client_id
-                ORDER BY a.date DESC, a.time DESC
+                WHERE a.vet_id = @vet_id
+                ORDER BY a.scheduled_time ASC
             `);
-        
         return result.recordset;
     } catch (error) {
-        console.error("Error retrieving appointments for user:", error);
-        throw new Error("Failed to load user appointments.");
+        console.error("Database Error in getAppointmentsByVetId:", error);
+        throw error;
     }
 };
 
 /**
- * Creates a new appointment.
- * SYNCED: Maps 'scheduled_time' into separate 'date' and 'time' columns.
+ * Create a new appointment.
+ * FIXED: Added validation to prevent Foreign Key conflicts with VetProfiles.
  */
-const createAppointment = async (appointment: { vet_id: any; user_id: any; service_id: any; scheduled_time: any; status?: "pending" | undefined; }) => {
+export const createAppointment = async (appointmentData: any): Promise<string> => {
     const { 
         vet_id, 
-        user_id, // Ensure we pass user_id here
+        client_id, 
         service_id, 
         scheduled_time, 
         status = 'pending' 
-    } = appointment;
+    } = appointmentData;
 
-    const pool = await poolPromise;
-    const appointment_id = crypto.randomUUID(); 
-
-    // Split 'YYYY-MM-DD HH:mm:ss' into two parts for your DB columns
-    const [datePart, timePart] = scheduled_time.split(' ');
+    // Ensure we have an appointment_id (generate one if frontend didn't)
+    const appointment_id = appointmentData.appointment_id || `APP-${Date.now()}`;
 
     try {
+        const pool = await poolPromise;
+        
+        // --- STEP 1: VALIDATION ---
+        // Check if the vet_id exists in VetProfiles to avoid the FK constraint error
+        const checkVet = await pool.request()
+            .input('vet_id', sql.VarChar(100), vet_id)
+            .query('SELECT vet_id FROM VetProfiles WHERE vet_id = @vet_id');
+
+        if (checkVet.recordset.length === 0) {
+            throw new Error(`Foreign Key Violation: Vet ID "${vet_id}" does not exist in VetProfiles.`);
+        }
+
+        // --- STEP 2: INSERTION ---
         const request = pool.request();
+        const dateValue = new Date(scheduled_time);
+
+        // Basic date validation
+        if (isNaN(dateValue.getTime())) {
+            throw new Error("Invalid scheduled_time format.");
+        }
+
         request
             .input('appointment_id', sql.VarChar(100), appointment_id)
             .input('vet_id', sql.VarChar(100), vet_id)
-            .input('user_id', sql.VarChar(100), user_id)
-            .input('service_id', sql.VarChar(100), service_id)
-            .input('date', sql.VarChar(20), datePart)
-            .input('time', sql.VarChar(20), timePart)
+            .input('client_id', sql.VarChar(100), client_id)
+            .input('service_id', sql.VarChar(100), service_id || 'S1')
+            .input('scheduled_time', sql.DateTime, dateValue)
             .input('status', sql.VarChar(20), status);
 
         await request.query(`
-            INSERT INTO appointments 
-                (appointment_id, vet_id, user_id, service_id, date, time, status)
+            INSERT INTO Appointments 
+                (appointment_id, vet_id, client_id, service_id, scheduled_time, status)
             VALUES 
-                (@appointment_id, @vet_id, @user_id, @service_id, @date, @time, @status)
+                (@appointment_id, @vet_id, @client_id, @service_id, @scheduled_time, @status)
         `);
 
         return appointment_id; 
     } catch (error) {
-        console.error("Error creating appointment:", error);
+        console.error("Database Error in createAppointment:", error);
+        throw error; 
+    }
+};
+
+/**
+ * Get appointments for a specific user (Client or Vet).
+ */
+export const getAppointmentsByUserId = async (user_id: string): Promise<any[]> => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request()
+            .input('user_id', sql.VarChar(100), user_id)
+            .query(`
+                SELECT a.appointment_id, a.status, a.scheduled_time, 
+                       s.name AS service_name, v.name AS vet_name, c.name AS client_name
+                FROM Appointments a
+                LEFT JOIN Users v ON a.vet_id = v.user_id
+                LEFT JOIN Users c ON a.client_id = c.user_id
+                LEFT JOIN Services s ON a.service_id = s.service_id
+                WHERE a.client_id = @user_id OR a.vet_id = @user_id
+                ORDER BY a.scheduled_time DESC
+            `);
+        return result.recordset;
+    } catch (error) {
+        console.error("Error retrieving user appointments:", error);
         throw error;
     }
 };
 
 /**
- * Admin view: Fetch all
+ * Updates the status of an appointment.
  */
-const getAllAppointments = async () => {
+export const updateAppointmentStatus = async (appointmentId: string, status: string): Promise<boolean> => {
     try {
         const pool = await poolPromise;
-        const result = await pool.request().query(`
-            SELECT a.*, v.name AS vet_name, u.name AS client_name
-            FROM appointments a
-            LEFT JOIN Users v ON a.vet_id = v.user_id
-            LEFT JOIN Users u ON a.user_id = u.user_id
-        `);
-        return result.recordset;
+        const result = await pool.request()
+            .input('appointment_id', sql.VarChar(100), appointmentId)
+            .input('status', sql.VarChar(20), status)
+            .query(`
+                UPDATE Appointments 
+                SET status = @status 
+                WHERE appointment_id = @appointment_id
+            `);
+        
+        return (result.rowsAffected[0] > 0);
     } catch (error) {
+        console.error("Database Error in updateAppointmentStatus:", error);
         throw error;
     }
 };
 
-module.exports = { 
-    getAllAppointments, 
-    createAppointment, 
-    getAppointmentsByUserId 
+/**
+ * Deletes an appointment from the database.
+ */
+export const deleteAppointmentById = async (appointmentId: string): Promise<boolean> => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request()
+            .input('appointment_id', sql.VarChar(100), appointmentId)
+            .query(`
+                DELETE FROM Appointments 
+                WHERE appointment_id = @appointment_id
+            `);
+        
+        return (result.rowsAffected[0] > 0);
+    } catch (error) {
+        console.error("Database Error in deleteAppointmentById:", error);
+        throw error;
+    }
 };
