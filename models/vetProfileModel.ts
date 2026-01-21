@@ -4,30 +4,36 @@ import * as crypto from 'crypto';
 
 // --- REUSABLE SERVICE SYNCHRONIZATION FUNCTION ---
 export const syncVetServices = async (vet_id: string, serviceNames: string[], transaction: sql.Transaction): Promise<void> => {
+    // Delete existing links to refresh services
     await transaction.request()
         .input('vet_id', sql.VarChar(100), vet_id)
         .query(`DELETE FROM VetServices WHERE vet_id = @vet_id;`);
 
+    if (!serviceNames || serviceNames.length === 0) return;
+
     for (const serviceName of serviceNames) {
         let serviceId: string;
         
+        // 1. Check if service exists in global table
         const findResult = await transaction.request()
-            .input('service_name', sql.VarChar(100), serviceName)
+            .input('service_name', sql.VarChar(100), serviceName.trim())
             .query(`SELECT service_id FROM Services WHERE name = @service_name;`);
 
         if (findResult.recordset.length > 0) {
             serviceId = findResult.recordset[0].service_id;
         } else {
+            // 2. Create service if it doesn't exist
             serviceId = crypto.randomUUID();
             await transaction.request()
                 .input('new_service_id', sql.VarChar(100), serviceId)
-                .input('service_name', sql.VarChar(100), serviceName)
+                .input('service_name', sql.VarChar(100), serviceName.trim())
                 .query(`
                     INSERT INTO Services (service_id, name, description)
                     VALUES (@new_service_id, @service_name, 'Service provided by a vet');
                 `);
         }
 
+        // 3. Link vet to service
         await transaction.request()
             .input('vet_id', sql.VarChar(100), vet_id)
             .input('service_id_to_link', sql.VarChar(100), serviceId)
@@ -38,11 +44,19 @@ export const syncVetServices = async (vet_id: string, serviceNames: string[], tr
     }
 };
 
-// --- GET ALL PROFILES (Updated with JSON aggregation for Services) ---
-export const getAllVetProfiles = async (): Promise<any[]> => {
+// --- GET ALL PROFILES ---
+export const getAllVetProfiles = async (filters?: { location?: string, service?: string }): Promise<any[]> => {
     try {
         const pool = await poolPromise;
-        const result = await pool.request().query(`
+        const request = pool.request();
+
+        const locationTerm = filters?.location ? `%${filters.location}%` : '%';
+        const serviceTerm = filters?.service ? `%${filters.service}%` : '%';
+
+        request.input('location', sql.VarChar(100), locationTerm);
+        request.input('serviceName', sql.VarChar(100), serviceTerm);
+
+        const result = await request.query(`
             SELECT 
                 u.user_id AS vet_id, u.name, u.email, u.phone,
                 vp.bio, vp.clinic_name, vp.address, vp.city, vp.state, vp.zip_code, vp.latitude, vp.longitude, vp.profile_pic_url,
@@ -62,20 +76,27 @@ export const getAllVetProfiles = async (): Promise<any[]> => {
                 GROUP BY vet_id
             ) r ON r.vet_id = u.user_id
             WHERE u.role = 'vet'
+            AND (vp.city LIKE @location OR vp.state LIKE @location OR vp.clinic_name LIKE @location)
+            AND (
+                EXISTS (
+                    SELECT 1 FROM VetServices vs
+                    JOIN Services s ON vs.service_id = s.service_id
+                    WHERE vs.vet_id = u.user_id AND s.name LIKE @serviceName
+                )
+            )
         `);
 
-        // Parse JSON strings from SQL Server
         return result.recordset.map(row => ({
             ...row,
             services: row.services ? JSON.parse(row.services) : []
         }));
     } catch (error) {
-        console.error("Error retrieving all vet profiles:", error);
-        throw new Error("Failed to load vet profiles.");
+        console.error("Error retrieving vet profiles:", error);
+        throw error;
     }
 };
 
-// --- GET PROFILE BY ID (Updated with JSON aggregation) ---
+// --- GET PROFILE BY ID ---
 export const getVetProfileById = async (vet_id: string): Promise<any | undefined> => {
     try {
         const pool = await poolPromise;
@@ -105,84 +126,87 @@ export const getVetProfileById = async (vet_id: string): Promise<any | undefined
             services: profile.services ? JSON.parse(profile.services) : []
         };
     } catch (error) {
-        console.error("Error retrieving vet profile by ID:", error);
-        throw new Error("Database error during profile retrieval.");
-    }
-};
-
-// --- CREATE PROFILE (Syncs services correctly) ---
-export const createVetProfile = async (vetProfile: any): Promise<void> => {
-    const pool = await poolPromise;
-    const transaction = new sql.Transaction(pool);
-    const { user_id: vet_id, services = [] } = vetProfile;
-
-    try {
-        await transaction.begin();
-        const request = transaction.request();
-
-        await request
-            .input('vet_id', sql.VarChar(100), vet_id)
-            .input('bio', sql.Text, vetProfile.bio)
-            .input('clinic_name', sql.VarChar(100), vetProfile.clinic_name)
-            .input('address', sql.VarChar(255), vetProfile.address)
-            .input('city', sql.VarChar(50), vetProfile.city)
-            .input('state', sql.VarChar(50), vetProfile.state)
-            .input('zip_code', sql.VarChar(20), vetProfile.zip_code)
-            .input('latitude', sql.Decimal(9, 6), vetProfile.latitude)
-            .input('longitude', sql.Decimal(9, 6), vetProfile.longitude)
-            .input('profile_pic_url', sql.VarChar(255), vetProfile.profile_pic_url)
-            .query(`
-                INSERT INTO VetProfiles 
-                    (vet_id, bio, clinic_name, address, city, state, zip_code, latitude, longitude, profile_pic_url)
-                VALUES 
-                    (@vet_id, @bio, @clinic_name, @address, @city, @state, @zip_code, @latitude, @longitude, @profile_pic_url);
-            `);
-
-        if (services.length > 0) {
-            await syncVetServices(vet_id, services, transaction);
-        }
-        await transaction.commit();
-    } catch (error) {
-        await transaction.rollback(); 
         throw error;
     }
 };
 
-// --- UPDATE PROFILE (Syncs services correctly) ---
-export const updateVetProfile = async (vet_id: string, vetProfile: any): Promise<void> => {
+// --- CREATE VET PROFILE ---
+export const createVetProfile = async (data: any): Promise<void> => {
     const pool = await poolPromise;
     const transaction = new sql.Transaction(pool);
-    const { services = [] } = vetProfile;
 
     try {
         await transaction.begin();
-        const request = transaction.request();
-        
-        await request
-            .input('vet_id', sql.VarChar(100), vet_id)
-            .input('bio', sql.Text, vetProfile.bio)
-            .input('clinic_name', sql.VarChar(100), vetProfile.clinic_name)
-            .input('address', sql.VarChar(255), vetProfile.address)
-            .input('city', sql.VarChar(50), vetProfile.city)
-            .input('state', sql.VarChar(50), vetProfile.state)
-            .input('zip_code', sql.VarChar(20), vetProfile.zip_code)
-            .input('latitude', sql.Decimal(9, 6), vetProfile.latitude)
-            .input('longitude', sql.Decimal(9, 6), vetProfile.longitude)
-            .input('profile_pic_url', sql.VarChar(255), vetProfile.profile_pic_url)
+
+        // 1. Insert Profile Info
+        await transaction.request()
+            .input('vet_id', sql.VarChar(100), data.user_id)
+            .input('bio', sql.Text, data.bio || '')
+            .input('clinic_name', sql.VarChar(255), data.clinic_name || '')
+            .input('address', sql.VarChar(255), data.address || '')
+            .input('city', sql.VarChar(100), data.city || '')
+            .input('state', sql.VarChar(100), data.state || '')
+            .input('zip_code', sql.VarChar(20), data.zip_code || '')
             .query(`
-                UPDATE VetProfiles SET
-                    bio = @bio, clinic_name = @clinic_name, address = @address,
-                    city = @city, state = @state, zip_code = @zip_code,
-                    latitude = @latitude, longitude = @longitude, profile_pic_url = @profile_pic_url
-                WHERE vet_id = @vet_id;
+                INSERT INTO VetProfiles (vet_id, bio, clinic_name, address, city, state, zip_code)
+                VALUES (@vet_id, @bio, @clinic_name, @address, @city, @state, @zip_code)
             `);
 
-        if (services && Array.isArray(services)) {
-            await syncVetServices(vet_id, services, transaction);
+        // 2. Sync Services
+        if (data.services) {
+            await syncVetServices(data.user_id, data.services, transaction);
         }
+
         await transaction.commit();
     } catch (error) {
-        await transaction.rollback(); 
+        await transaction.rollback();
+        console.error("Rollback in createVetProfile:", error);
+        throw error;
+    }
+};
+
+// --- UPDATE VET PROFILE ---
+export const updateVetProfile = async (vet_id: string, data: any): Promise<void> => {
+    const pool = await poolPromise;
+    const transaction = new sql.Transaction(pool);
+
+    try {
+        await transaction.begin();
+
+        // 1. Update Profile Fields
+        await transaction.request()
+            .input('vet_id', sql.VarChar(100), vet_id)
+            .input('bio', sql.Text, data.bio || '')
+            .input('clinic_name', sql.VarChar(255), data.clinic_name || '')
+            .input('address', sql.VarChar(255), data.address || '')
+            .input('city', sql.VarChar(100), data.city || '')
+            .input('state', sql.VarChar(100), data.state || '')
+            .input('zip_code', sql.VarChar(20), data.zip_code || '')
+            .query(`
+                UPDATE VetProfiles 
+                SET bio = @bio, 
+                    clinic_name = @clinic_name, 
+                    address = @address, 
+                    city = @city, 
+                    state = @state, 
+                    zip_code = @zip_code
+                WHERE vet_id = @vet_id
+            `);
+
+        // 2. Refresh Services
+        if (data.services) {
+            // Handle both string arrays and comma-separated strings if bio contained them
+            const servicesToSync = Array.isArray(data.services) 
+                ? data.services 
+                : data.services.split(',').map((s: string) => s.trim());
+                
+            await syncVetServices(vet_id, servicesToSync, transaction);
+        }
+
+        await transaction.commit();
+    } catch (error) {
+        await transaction.rollback();
+        console.error("Rollback in updateVetProfile:", error);
         throw error;
     }
 };

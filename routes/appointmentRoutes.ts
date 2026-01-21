@@ -3,15 +3,18 @@ const router = express.Router();
 import appointmentController from '../controllers/appointmentController';
 import { auth } from '../middleware/auth'; 
 
-// Fix: Use getMyAppointments for the client view
+// Fetch appointments for the logged-in client
 router.get('/my-appointments', auth, appointmentController.getMyAppointments);
 
-// Fix: Use getVetAppointments for the vet view (Resolves your 404/Undefined error)
+// Fetch appointments for a specific veterinarian dashboard
 router.get('/vet/:vetId', auth, appointmentController.getVetAppointments);
 
-// Rest of your routes...
+// Create a new appointment booking
 router.post('/', auth, appointmentController.createAppointment);
-router.patch('/:appointmentId', auth, appointmentController.updateStatus);
+
+router.put('/:appointmentId/status', auth, appointmentController.updateStatus);
+
+// Remove an appointment record
 router.delete('/:appointmentId', auth, appointmentController.deleteAppointment);
 
 export default router;
